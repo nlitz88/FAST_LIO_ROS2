@@ -57,6 +57,7 @@ class ImuProcess
   V3D cov_bias_gyr;
   V3D cov_bias_acc;
   double first_lidar_time;
+  V3D get_angvel_last() const { return angvel_last; }
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
