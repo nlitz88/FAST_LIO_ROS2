@@ -5,7 +5,7 @@
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
-Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
+Preprocess::Preprocess() : feature_enabled(0), lidar_type(LIVOX_PC2), blind(0.01), point_filter_num(1)
 {
   inf_bound = 10;
   N_SCANS = 6;
@@ -44,12 +44,6 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
   point_filter_num = pfilt_num;
 }
 
-void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
-{
-  avia_handler(msg);
-  *pcl_out = pl_surf;
-}
-
 void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
 {
   switch (time_unit)
@@ -85,6 +79,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       mid360_handler(msg);
       break;
 
+    case LIVOX_PC2:
+      livox_pc2_handler(msg);
+      break;
+
     default:
       default_handler(msg);
       break;
@@ -92,14 +90,17 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
   *pcl_out = pl_surf;
 }
 
-void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg)
+void Preprocess::livox_pc2_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
 {
   pl_surf.clear();
   pl_corn.clear();
   pl_full.clear();
-  double t1 = omp_get_wtime();
-  int plsize = msg->point_num;
-  // cout<<"plsie: "<<plsize<<endl;
+
+  pcl::PointCloud<livox_ros::LivoxPointXyzitlt> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.points.size();
+  if (plsize == 0)
+    return;
 
   pl_corn.reserve(plsize);
   pl_surf.reserve(plsize);
@@ -116,21 +117,20 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
   {
     for (uint i = 1; i < plsize; i++)
     {
-      if ((msg->points[i].line < N_SCANS) &&
-          ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
+      if ((pl_orig.points[i].line < N_SCANS) &&
+          ((pl_orig.points[i].tag & 0x30) == 0x10 || (pl_orig.points[i].tag & 0x30) == 0x00))
       {
-        pl_full[i].x = msg->points[i].x;
-        pl_full[i].y = msg->points[i].y;
-        pl_full[i].z = msg->points[i].z;
-        pl_full[i].intensity = msg->points[i].reflectivity;
+        pl_full[i].x = pl_orig.points[i].x;
+        pl_full[i].y = pl_orig.points[i].y;
+        pl_full[i].z = pl_orig.points[i].z;
+        pl_full[i].intensity = pl_orig.points[i].intensity;
         pl_full[i].curvature =
-            msg->points[i].offset_time / float(1000000);  // use curvature as time of each laser points
+            pl_orig.points[i].t / float(1000000);  // use curvature as time of each laser points
 
-        bool is_new = false;
         if ((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7) ||
             (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
         {
-          pl_buff[msg->points[i].line].push_back(pl_full[i]);
+          pl_buff[pl_orig.points[i].line].push_back(pl_full[i]);
         }
       }
     }
@@ -167,17 +167,17 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
   {
     for (uint i = 1; i < plsize; i++)
     {
-      if ((msg->points[i].line < N_SCANS) &&
-          ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
+      if ((pl_orig.points[i].line < N_SCANS) &&
+          ((pl_orig.points[i].tag & 0x30) == 0x10 || (pl_orig.points[i].tag & 0x30) == 0x00))
       {
         valid_num++;
         if (valid_num % point_filter_num == 0)
         {
-          pl_full[i].x = msg->points[i].x;
-          pl_full[i].y = msg->points[i].y;
-          pl_full[i].z = msg->points[i].z;
-          pl_full[i].intensity = msg->points[i].reflectivity;
-          pl_full[i].curvature = msg->points[i].offset_time /
+          pl_full[i].x = pl_orig.points[i].x;
+          pl_full[i].y = pl_orig.points[i].y;
+          pl_full[i].z = pl_orig.points[i].z;
+          pl_full[i].intensity = pl_orig.points[i].intensity;
+          pl_full[i].curvature = pl_orig.points[i].t /
                                  float(1000000);  // use curvature as time of each laser points, curvature unit: ms
 
           if(((abs(pl_full[i].x - pl_full[i-1].x) > 1e-7)
@@ -1004,7 +1004,7 @@ int Preprocess::plane_judge(const PointCloudXYZI& pl, vector<orgtype>& types, ui
     return 0;
   }
 
-  if (lidar_type == AVIA)
+  if (lidar_type == LIVOX_PC2)
   {
     double dismax_mid = disarr[0] / disarr[disarrsize / 2];
     double dismid_min = disarr[disarrsize / 2] / disarr[disarrsize - 2];
