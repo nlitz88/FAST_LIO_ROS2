@@ -2,7 +2,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <livox_ros_driver2/msg/custom_msg.hpp>
 
 using namespace std;
 
@@ -13,7 +12,11 @@ typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
 enum LID_TYPE
 {
-  AVIA = 1,
+  LIVOX_PC2 = 1,  // Livox point cloud carried over PointCloud2 (x,y,z,t,intensity,tag,line) --
+                  // e.g. from koide3/livox_to_pointcloud2 or a driver's native PointCloud2
+                  // output -- instead of livox_ros_driver2::msg::CustomMsg. Same per-point tag/
+                  // line filtering and offset-time deskewing as the old CustomMsg (AVIA) path;
+                  // see https://github.com/nlitz88/FAST_LIO_ROS2/issues/1.
   VELO16,
   OUST64,
   MID360
@@ -131,6 +134,19 @@ typedef struct {
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
 } LivoxPointXyzitl;
+
+// Matches the PointCloud2 layout produced by koide3/livox_to_pointcloud2 (and equivalent
+// converters) from a livox_ros_driver2::msg::CustomMsg: one field per CustomMsg point member,
+// including the per-point "t" offset time (ns since scan start) that AVIA-style deskewing needs.
+typedef struct {
+  float x;             /**< X axis, Unit:m */
+  float y;             /**< Y axis, Unit:m */
+  float z;             /**< Z axis, Unit:m */
+  uint32_t t;           /**< Offset time from scan start, Unit:ns */
+  float intensity;     /**< Reflectivity   */
+  uint8_t tag;          /**< Livox point tag   */
+  uint8_t line;         /**< Laser line id     */
+} LivoxPointXyzitlt;
 }
 POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (float, x, x)
@@ -150,6 +166,16 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitl,
     (uint8_t, line, line)
 )
 
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitlt,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (std::uint32_t, t, t)
+    (float, intensity, intensity)
+    (uint8_t, tag, tag)
+    (uint8_t, line, line)
+)
+
 class Preprocess
 {
   public:
@@ -157,8 +183,7 @@ class Preprocess
 
   Preprocess();
   ~Preprocess();
-  
-  void process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
+
   void process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void set(bool feat_en, int lid_type, double bld, int pfilt_num);
 
@@ -173,7 +198,7 @@ class Preprocess
   // ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:
-  void avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg);
+  void livox_pc2_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
