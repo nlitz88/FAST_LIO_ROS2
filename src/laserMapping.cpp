@@ -143,9 +143,6 @@ state_ikfom state_point;
 vect3 pos_lid;
 
 nav_msgs::msg::Path path;
-nav_msgs::msg::Odometry odomAftMapped;
-geometry_msgs::msg::Quaternion geoQuat;
-geometry_msgs::msg::PoseStamped msg_body_pose;
 
 // Flag to check whether or not we need to look up the transform.
 bool have_lidar_body_frame_tf{false};
@@ -632,17 +629,51 @@ void save_to_pcd()
     pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
 
-template<typename T>
-void set_posestamp(T & out)
+// Returns a full odometry message with the current KF state expressed in the lidar_link frame.
+// Pose is local_frame_from_lidar_link. Twist is in the lidar_link frame (child_frame_id).
+nav_msgs::msg::Odometry get_lidar_link_odometry()
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
-    
+    nav_msgs::msg::Odometry lidar_link_odom;
+    lidar_link_odom.header.frame_id = local_frame_id;
+    lidar_link_odom.header.stamp = get_ros_time(lidar_end_time);
+    lidar_link_odom.child_frame_id = lidar_link_frame_id;
+
+    // Pose: local_frame_from_lidar_link
+    lidar_link_odom.pose.pose.position.x = state_point.pos(0);
+    lidar_link_odom.pose.pose.position.y = state_point.pos(1);
+    lidar_link_odom.pose.pose.position.z = state_point.pos(2);
+    lidar_link_odom.pose.pose.orientation.x = state_point.rot.coeffs()[0];
+    lidar_link_odom.pose.pose.orientation.y = state_point.rot.coeffs()[1];
+    lidar_link_odom.pose.pose.orientation.z = state_point.rot.coeffs()[2];
+    lidar_link_odom.pose.pose.orientation.w = state_point.rot.coeffs()[3];
+
+    // Pose covariance from the KF.
+    auto P = kf.get_P();
+    for (int i = 0; i < 6; i++)
+    {
+        int k = i < 3 ? i + 3 : i - 3;
+        lidar_link_odom.pose.covariance[i*6 + 0] = P(k, 3);
+        lidar_link_odom.pose.covariance[i*6 + 1] = P(k, 4);
+        lidar_link_odom.pose.covariance[i*6 + 2] = P(k, 5);
+        lidar_link_odom.pose.covariance[i*6 + 3] = P(k, 0);
+        lidar_link_odom.pose.covariance[i*6 + 4] = P(k, 1);
+        lidar_link_odom.pose.covariance[i*6 + 5] = P(k, 2);
+    }
+
+    // Linear velocity: state_point.vel is in local_frame; rotate to lidar_link frame.
+    // R_lidar_link_from_local_frame = R_local_frame_from_lidar_link^T = state_point.rot^T
+    V3D vel_lidar_link = state_point.rot.toRotationMatrix().transpose() * state_point.vel;
+    lidar_link_odom.twist.twist.linear.x = vel_lidar_link(0);
+    lidar_link_odom.twist.twist.linear.y = vel_lidar_link(1);
+    lidar_link_odom.twist.twist.linear.z = vel_lidar_link(2);
+
+    // Angular velocity: bias-corrected IMU gyro measurement, already in lidar_link frame.
+    V3D angvel = p_imu->get_angvel_last();
+    lidar_link_odom.twist.twist.angular.x = angvel(0);
+    lidar_link_odom.twist.twist.angular.y = angvel(1);
+    lidar_link_odom.twist.twist.angular.z = angvel(2);
+
+    return lidar_link_odom;
 }
 
 bool get_lidar_link_from_body_frame_tf(
@@ -665,27 +696,79 @@ bool get_lidar_link_from_body_frame_tf(
     return true;
 }
 
+// Retargets an odometry message to a new child frame, transforming both pose and twist.
+// tf_old_child_from_new_child describes the static transform between the two child frames.
+// Angular velocity is rotated to the new frame (no lever arm).
+// Linear velocity accounts for the lever arm: v_new = R_new_from_old * (v_old + ω_old × p_new_in_old).
+nav_msgs::msg::Odometry transform_odometry_child(
+    const nav_msgs::msg::Odometry & odom,
+    const geometry_msgs::msg::TransformStamped & tf_old_child_from_new_child,
+    const std::string & new_child_frame_id)
+{
+    // R_old_child_from_new_child and the lever arm (position of new child origin in old child frame).
+    const auto & rot = tf_old_child_from_new_child.transform.rotation;
+    Eigen::Quaterniond q_old_child_from_new_child(rot.w, rot.x, rot.y, rot.z);
+    Eigen::Matrix3d R_old_child_from_new_child = q_old_child_from_new_child.toRotationMatrix();
+    Eigen::Matrix3d R_new_child_from_old_child = R_old_child_from_new_child.transpose();
+
+    const auto & tl = tf_old_child_from_new_child.transform.translation;
+    Eigen::Vector3d p_new_child_in_old_child(tl.x, tl.y, tl.z);
+
+    // Current velocities in old_child frame.
+    Eigen::Vector3d omega_old_child(
+        odom.twist.twist.angular.x,
+        odom.twist.twist.angular.y,
+        odom.twist.twist.angular.z);
+    Eigen::Vector3d v_old_child(
+        odom.twist.twist.linear.x,
+        odom.twist.twist.linear.y,
+        odom.twist.twist.linear.z);
+
+    // Angular velocity: pure rotation of the vector, no lever arm.
+    Eigen::Vector3d omega_new_child = R_new_child_from_old_child * omega_old_child;
+
+    // Linear velocity: rotate and add lever arm correction.
+    Eigen::Vector3d v_new_child = R_new_child_from_old_child *
+        (v_old_child + omega_old_child.cross(p_new_child_in_old_child));
+
+    // Compose poses: local_frame_from_new_child = local_frame_from_old_child * old_child_from_new_child
+    geometry_msgs::msg::Transform local_frame_from_old_child_tf;
+    local_frame_from_old_child_tf.translation.x = odom.pose.pose.position.x;
+    local_frame_from_old_child_tf.translation.y = odom.pose.pose.position.y;
+    local_frame_from_old_child_tf.translation.z = odom.pose.pose.position.z;
+    local_frame_from_old_child_tf.rotation = odom.pose.pose.orientation;
+
+    tf2::Transform tf2_local_frame_from_old_child;
+    tf2::Transform tf2_old_child_from_new_child;
+    tf2::fromMsg(local_frame_from_old_child_tf, tf2_local_frame_from_old_child);
+    tf2::fromMsg(tf_old_child_from_new_child.transform, tf2_old_child_from_new_child);
+    geometry_msgs::msg::Transform local_frame_from_new_child_tf =
+        tf2::toMsg(tf2_local_frame_from_old_child * tf2_old_child_from_new_child);
+
+    // Build the output odometry.
+    nav_msgs::msg::Odometry odom_new_child = odom;
+    odom_new_child.child_frame_id = new_child_frame_id;
+    odom_new_child.pose.pose.position.x = local_frame_from_new_child_tf.translation.x;
+    odom_new_child.pose.pose.position.y = local_frame_from_new_child_tf.translation.y;
+    odom_new_child.pose.pose.position.z = local_frame_from_new_child_tf.translation.z;
+    odom_new_child.pose.pose.orientation = local_frame_from_new_child_tf.rotation;
+    odom_new_child.twist.twist.linear.x = v_new_child(0);
+    odom_new_child.twist.twist.linear.y = v_new_child(1);
+    odom_new_child.twist.twist.linear.z = v_new_child(2);
+    odom_new_child.twist.twist.angular.x = omega_new_child(0);
+    odom_new_child.twist.twist.angular.y = omega_new_child(1);
+    odom_new_child.twist.twist.angular.z = omega_new_child(2);
+
+    return odom_new_child;
+}
+
 void publish_odometry(
     const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
     std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
     std::unique_ptr<tf2_ros::Buffer> & tf_buffer)
 {
-    // Populate msg_body_pose with the current lidar/IMU pose in the local frame.
-    set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);
-    msg_body_pose.header.frame_id = local_frame_id;
+    nav_msgs::msg::Odometry lidar_link_odom = get_lidar_link_odometry();
 
-    // Build local_frame->lidar_link transform from the current state estimate.
-    geometry_msgs::msg::TransformStamped tf_local_frame_from_lidar_link;
-    tf_local_frame_from_lidar_link.header.frame_id = local_frame_id;
-    tf_local_frame_from_lidar_link.header.stamp = msg_body_pose.header.stamp;
-    tf_local_frame_from_lidar_link.child_frame_id = lidar_link_frame_id;
-    tf_local_frame_from_lidar_link.transform.translation.x = msg_body_pose.pose.position.x;
-    tf_local_frame_from_lidar_link.transform.translation.y = msg_body_pose.pose.position.y;
-    tf_local_frame_from_lidar_link.transform.translation.z = msg_body_pose.pose.position.z;
-    tf_local_frame_from_lidar_link.transform.rotation = msg_body_pose.pose.orientation;
-
-    // Look up the static lidar_link->body_frame mount transform.
     geometry_msgs::msg::TransformStamped tf_lidar_link_from_body_frame;
     if (!get_lidar_link_from_body_frame_tf(tf_lidar_link_from_body_frame, tf_buffer)) {
         static rclcpp::Clock clock(RCL_STEADY_TIME);
@@ -695,46 +778,31 @@ void publish_odometry(
         return;
     }
 
-    // Compose: local_frame->lidar_link * lidar_link->body_frame = local_frame->body_frame
-    tf2::Transform tf2_local_frame_from_lidar_link;
-    tf2::Transform tf2_lidar_link_from_body_frame;
-    tf2::fromMsg(tf_local_frame_from_lidar_link.transform, tf2_local_frame_from_lidar_link);
-    tf2::fromMsg(tf_lidar_link_from_body_frame.transform, tf2_lidar_link_from_body_frame);
+    nav_msgs::msg::Odometry body_frame_odom =
+        transform_odometry_child(lidar_link_odom, tf_lidar_link_from_body_frame, body_frame_id);
 
+    // Broadcast local_frame -> body_frame TF from the composed pose.
     geometry_msgs::msg::TransformStamped tf_local_frame_from_body_frame;
     tf_local_frame_from_body_frame.header.frame_id = local_frame_id;
-    tf_local_frame_from_body_frame.header.stamp = msg_body_pose.header.stamp;
+    tf_local_frame_from_body_frame.header.stamp = body_frame_odom.header.stamp;
     tf_local_frame_from_body_frame.child_frame_id = body_frame_id;
-    tf_local_frame_from_body_frame.transform = tf2::toMsg(tf2_local_frame_from_lidar_link * tf2_lidar_link_from_body_frame);
-
+    tf_local_frame_from_body_frame.transform.translation.x = body_frame_odom.pose.pose.position.x;
+    tf_local_frame_from_body_frame.transform.translation.y = body_frame_odom.pose.pose.position.y;
+    tf_local_frame_from_body_frame.transform.translation.z = body_frame_odom.pose.pose.position.z;
+    tf_local_frame_from_body_frame.transform.rotation = body_frame_odom.pose.pose.orientation;
     tf_br->sendTransform(tf_local_frame_from_body_frame);
 
-    // Publish odometry reporting the body_frame pose in the local frame.
-    nav_msgs::msg::Odometry odom_local_frame_from_body_frame;
-    odom_local_frame_from_body_frame.header.frame_id = local_frame_id;
-    odom_local_frame_from_body_frame.header.stamp = msg_body_pose.header.stamp;
-    odom_local_frame_from_body_frame.child_frame_id = body_frame_id;
-    odom_local_frame_from_body_frame.pose.pose.position.x = tf_local_frame_from_body_frame.transform.translation.x;
-    odom_local_frame_from_body_frame.pose.pose.position.y = tf_local_frame_from_body_frame.transform.translation.y;
-    odom_local_frame_from_body_frame.pose.pose.position.z = tf_local_frame_from_body_frame.transform.translation.z;
-    odom_local_frame_from_body_frame.pose.pose.orientation = tf_local_frame_from_body_frame.transform.rotation;
-    auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odom_local_frame_from_body_frame.pose.covariance[i*6 + 0] = P(k, 3);
-        odom_local_frame_from_body_frame.pose.covariance[i*6 + 1] = P(k, 4);
-        odom_local_frame_from_body_frame.pose.covariance[i*6 + 2] = P(k, 5);
-        odom_local_frame_from_body_frame.pose.covariance[i*6 + 3] = P(k, 0);
-        odom_local_frame_from_body_frame.pose.covariance[i*6 + 4] = P(k, 1);
-        odom_local_frame_from_body_frame.pose.covariance[i*6 + 5] = P(k, 2);
-    }
-    pubOdomAftMapped->publish(odom_local_frame_from_body_frame);
+    pubOdomAftMapped->publish(body_frame_odom);
 }
 
-void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
+void publish_path(
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath,
+    std::unique_ptr<tf2_ros::Buffer> & tf_buffer)
 {
-    if (!have_lidar_body_frame_tf) {
+    nav_msgs::msg::Odometry lidar_link_odom = get_lidar_link_odometry();
+
+    geometry_msgs::msg::TransformStamped tf_lidar_link_from_body_frame;
+    if (!get_lidar_link_from_body_frame_tf(tf_lidar_link_from_body_frame, tf_buffer)) {
         static rclcpp::Clock clock(RCL_STEADY_TIME);
         RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fast_lio"), clock, 1000,
             "%s -> %s TF not yet available; skipping path publish.",
@@ -742,31 +810,12 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
         return;
     }
 
-    // Populate msg_body_pose with the current lidar/IMU pose in the local frame.
-    set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);
-    msg_body_pose.header.frame_id = local_frame_id;
-
-    // Transform the lidar pose to the body_frame pose using the cached mount transform.
-    geometry_msgs::msg::Transform local_frame_from_lidar_link_tf;
-    local_frame_from_lidar_link_tf.translation.x = msg_body_pose.pose.position.x;
-    local_frame_from_lidar_link_tf.translation.y = msg_body_pose.pose.position.y;
-    local_frame_from_lidar_link_tf.translation.z = msg_body_pose.pose.position.z;
-    local_frame_from_lidar_link_tf.rotation = msg_body_pose.pose.orientation;
-
-    tf2::Transform tf2_local_frame_from_lidar_link;
-    tf2::Transform tf2_lidar_link_from_body_frame;
-    tf2::fromMsg(local_frame_from_lidar_link_tf, tf2_local_frame_from_lidar_link);
-    tf2::fromMsg(tf_lidar_link_from_body_frame.transform, tf2_lidar_link_from_body_frame);
-    geometry_msgs::msg::Transform local_frame_from_body_frame_tf = tf2::toMsg(tf2_local_frame_from_lidar_link * tf2_lidar_link_from_body_frame);
+    nav_msgs::msg::Odometry body_frame_odom =
+        transform_odometry_child(lidar_link_odom, tf_lidar_link_from_body_frame, body_frame_id);
 
     geometry_msgs::msg::PoseStamped body_pose;
-    body_pose.header.stamp = msg_body_pose.header.stamp;
-    body_pose.header.frame_id = local_frame_id;
-    body_pose.pose.position.x = local_frame_from_body_frame_tf.translation.x;
-    body_pose.pose.position.y = local_frame_from_body_frame_tf.translation.y;
-    body_pose.pose.position.z = local_frame_from_body_frame_tf.translation.z;
-    body_pose.pose.orientation = local_frame_from_body_frame_tf.rotation;
+    body_pose.header = body_frame_odom.header;
+    body_pose.pose = body_frame_odom.pose.pose;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -1163,11 +1212,6 @@ private:
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            geoQuat.x = state_point.rot.coeffs()[0];
-            geoQuat.y = state_point.rot.coeffs()[1];
-            geoQuat.z = state_point.rot.coeffs()[2];
-            geoQuat.w = state_point.rot.coeffs()[3];
-
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
@@ -1179,7 +1223,7 @@ private:
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
-            if (path_en)                         publish_path(pubPath_);
+            if (path_en)                         publish_path(pubPath_, tf_buffer_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
